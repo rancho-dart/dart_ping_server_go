@@ -37,6 +37,9 @@ type ICMPPacket struct {
 	Payload  []byte
 }
 
+// 全局缓冲区
+var buf = make([]byte, 4096)
+
 func (h *DARTHeader) Pack() []byte {
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.BigEndian, h.Version)
@@ -87,11 +90,11 @@ func main() {
 	}
 
 	// 创建原始套接字监听DART协议
-	conn, err := net.ListenPacket(fmt.Sprintf("ip4:%d", DART_PROTOCOL), "0.0.0.0")
+	recvConn, err := net.ListenPacket(fmt.Sprintf("ip4:%d", DART_PROTOCOL), "0.0.0.0")
 	if err != nil {
 		log.Fatalf("Failed to listen: %v", err)
 	}
-	defer conn.Close()
+	defer recvConn.Close()
 
 	// 处理Ctrl+C
 	sigCh := make(chan os.Signal, 1)
@@ -99,15 +102,14 @@ func main() {
 	go func() {
 		<-sigCh
 		fmt.Println("\nServer shutting down...")
-		conn.Close()
+		recvConn.Close()
 		os.Exit(0)
 	}()
 
 	fmt.Println("DART Ping responder started. Waiting for requests...")
 
-	buf := make([]byte, 1024)
 	for {
-		n, addr, err := conn.ReadFrom(buf)
+		n, addr, err := recvConn.ReadFrom(buf)
 		if err != nil {
 			log.Printf("Read error: %v", err)
 			continue
@@ -154,13 +156,20 @@ func main() {
 			// 组装完整响应包
 			packet := append(dartHeader.Pack(), reply.Pack()...)
 
-			// 发送响应
-			_, err = conn.WriteTo(packet, addr)
+			// 使用独立的conn发送响应
+			// 使用net.Dial创建独立的原始套接字用于发送DART协议
+			sendConn, err := net.Dial("ip4:254", addr.String())
+			if err != nil {
+				log.Fatalf("Failed to create send connection: %v", err)
+			}
+
+			n, err = sendConn.Write(packet)
 			if err != nil {
 				log.Printf("Failed to send response: %v", err)
 			} else {
-				log.Printf("Responded to ping from %s (%s)", srcFQDN, addr.String())
+				log.Printf("Responded to ping from %s (%s), size: %d", srcFQDN, addr.String(), n)
 			}
+			sendConn.Close()
 		}
 	}
 }
