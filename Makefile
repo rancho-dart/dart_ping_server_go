@@ -5,8 +5,10 @@ SERVICE_NAME=dart_ping_daemon
 SERVICE_FILE=/etc/systemd/system/$(SERVICE_NAME).service
 BINARY_PATH=/usr/local/bin/$(SERVICE_NAME)
 
-# Build the binary
-build:
+# Build the binary only if the source files are newer than the binary
+build: $(SERVICE_NAME)
+
+$(SERVICE_NAME): dt_ping_server.go
 	go build -o $(SERVICE_NAME) .
 
 # Install the service
