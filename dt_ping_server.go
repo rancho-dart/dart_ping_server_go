@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"encoding/binary"
 	"fmt"
 	"log"
@@ -9,24 +8,15 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	// "time"
 )
 
+// 假设这些是你已有的常量和结构体
 const (
-	DART_PROTOCOL = 254
+	UDP_PORT      = 0xDA27
 	ICMP_PROTOCOL = 1
 	ICMP_ECHO     = 8
 	ICMP_REPLY    = 0
 )
-
-type DARTHeader struct {
-	Version       uint8
-	UpperProtocol uint8
-	DstLen        uint8
-	SrcLen        uint8
-	DstFQDN       []byte
-	SrcFQDN       []byte
-}
 
 type ICMPPacket struct {
 	Type     uint8
@@ -37,139 +27,129 @@ type ICMPPacket struct {
 	Payload  []byte
 }
 
-// 全局缓冲区
-var buf = make([]byte, 4096)
-
-func (h *DARTHeader) Pack() []byte {
-	buf := new(bytes.Buffer)
-	binary.Write(buf, binary.BigEndian, h.Version)
-	binary.Write(buf, binary.BigEndian, h.UpperProtocol)
-	binary.Write(buf, binary.BigEndian, h.DstLen)
-	binary.Write(buf, binary.BigEndian, h.SrcLen)
-	buf.Write(h.DstFQDN)
-	buf.Write(h.SrcFQDN)
-	return buf.Bytes()
+func (p *ICMPPacket) Pack() []byte {
+	buf := make([]byte, 8+len(p.Payload))
+	buf[0] = p.Type
+	buf[1] = p.Code
+	binary.BigEndian.PutUint16(buf[2:], p.Checksum)
+	binary.BigEndian.PutUint16(buf[4:], p.ID)
+	binary.BigEndian.PutUint16(buf[6:], p.Seq)
+	copy(buf[8:], p.Payload)
+	return buf
 }
 
 func (p *ICMPPacket) CalculateChecksum() uint16 {
-	p.Checksum = 0
+	buf := p.Pack()
 	var sum uint32
-
-	data := p.Pack()
-	for i := 0; i < len(data); i += 2 {
-		if i+1 < len(data) {
-			sum += uint32(data[i+1])<<8 | uint32(data[i])
-		} else {
-			sum += uint32(data[i]) << 8
-		}
+	for i := 0; i < len(buf)-1; i += 2 {
+		sum += uint32(binary.BigEndian.Uint16(buf[i:]))
 	}
-
-	sum = (sum >> 16) + (sum & 0xffff)
-	sum += sum >> 16
-
-	// 交换Checksum的高低字节顺序
-	checksum := uint16(^sum)
-	return (checksum<<8)&0xff00 | (checksum>>8)&0x00ff
+	if len(buf)%2 == 1 {
+		sum += uint32(buf[len(buf)-1]) << 8
+	}
+	for (sum >> 16) != 0 {
+		sum = (sum >> 16) + (sum & 0xFFFF)
+	}
+	return ^uint16(sum)
 }
 
-func (p *ICMPPacket) Pack() []byte {
-	buf := new(bytes.Buffer)
-	binary.Write(buf, binary.BigEndian, p.Type)
-	binary.Write(buf, binary.BigEndian, p.Code)
-	binary.Write(buf, binary.BigEndian, p.Checksum)
-	binary.Write(buf, binary.BigEndian, p.ID)
-	binary.Write(buf, binary.BigEndian, p.Seq)
-	buf.Write(p.Payload)
-	return buf.Bytes()
+type DARTHeader struct {
+	Version       uint8
+	UpperProtocol uint8
+	DstLen        uint8
+	SrcLen        uint8
+	DstFQDN       []byte
+	SrcFQDN       []byte
+}
+
+func (h *DARTHeader) Pack() []byte {
+	buf := []byte{h.Version, h.UpperProtocol, h.DstLen, h.SrcLen}
+	buf = append(buf, h.DstFQDN...)
+	buf = append(buf, h.SrcFQDN...)
+	return buf
 }
 
 func main() {
-	// 需要root权限运行
 	if os.Geteuid() != 0 {
 		log.Fatal("This program must be run as root")
 	}
 
-	// 创建原始套接字监听DART协议
-	recvConn, err := net.ListenPacket(fmt.Sprintf("ip4:%d", DART_PROTOCOL), "0.0.0.0")
+	// 使用标准UDP套接字（系统自动添加/解析UDP报头）
+	udpConn, err := net.ListenUDP("udp4", &net.UDPAddr{Port: UDP_PORT})
 	if err != nil {
-		log.Fatalf("Failed to listen: %v", err)
+		log.Fatalf("Failed to listen on UDP: %v", err)
 	}
-	defer recvConn.Close()
+	defer udpConn.Close()
 
-	// 处理Ctrl+C
+	// 处理 Ctrl+C
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT)
 	go func() {
 		<-sigCh
 		fmt.Println("\nServer shutting down...")
-		recvConn.Close()
+		udpConn.Close()
 		os.Exit(0)
 	}()
 
 	fmt.Println("DART Ping responder started. Waiting for requests...")
 
+	buf := make([]byte, 1500)
 	for {
-		n, addr, err := recvConn.ReadFrom(buf)
+		n, srcAddr, err := udpConn.ReadFromUDP(buf)
 		if err != nil {
 			log.Printf("Read error: %v", err)
 			continue
 		}
-
-		// 解析DART头
-		dartStart := 0
-		if buf[dartStart] != 1 || buf[dartStart+1] != ICMP_PROTOCOL {
-			continue // 版本或协议不匹配
-		}
-
-		dstLen := int(buf[dartStart+2])
-		srcLen := int(buf[dartStart+3])
-		dstFQDN := string(buf[dartStart+4 : dartStart+4+dstLen])
-		srcFQDN := string(buf[dartStart+4+dstLen : dartStart+4+dstLen+srcLen])
-
-		// 解析ICMP请求
-		icmpStart := dartStart + 4 + dstLen + srcLen
-		if n < icmpStart+8 {
+		if n < 8 {
 			continue
 		}
 
-		if buf[icmpStart] == ICMP_ECHO && buf[icmpStart+1] == 0 {
-			// 构造ICMP响应
-			reply := &ICMPPacket{
-				Type:    ICMP_REPLY,
-				Code:    0,
-				ID:      binary.BigEndian.Uint16(buf[icmpStart+4 : icmpStart+6]),
-				Seq:     binary.BigEndian.Uint16(buf[icmpStart+6 : icmpStart+8]),
-				Payload: buf[icmpStart+8 : n],
-			}
-			reply.Checksum = reply.CalculateChecksum()
+		// 解析 DART 头
+		if buf[0] != 1 || buf[1] != ICMP_PROTOCOL {
+			continue
+		}
+		dstLen := int(buf[2])
+		srcLen := int(buf[3])
+		if n < 4+dstLen+srcLen+8 {
+			continue
+		}
+		dstFQDN := string(buf[4 : 4+dstLen])
+		srcFQDN := string(buf[4+dstLen : 4+dstLen+srcLen])
+		icmpStart := 4 + dstLen + srcLen
 
-			// 构造DART头(交换源和目标)
-			dartHeader := &DARTHeader{
-				Version:       1,
-				UpperProtocol: ICMP_PROTOCOL,
-				DstLen:        uint8(len(srcFQDN)),
-				SrcLen:        uint8(len(dstFQDN)),
-				DstFQDN:       []byte(srcFQDN),
-				SrcFQDN:       []byte(dstFQDN),
-			}
+		if buf[icmpStart] != ICMP_ECHO || buf[icmpStart+1] != 0 {
+			continue
+		}
 
-			// 组装完整响应包
-			packet := append(dartHeader.Pack(), reply.Pack()...)
+		// 构造ICMP响应
+		reply := &ICMPPacket{
+			Type:    ICMP_REPLY,
+			Code:    0,
+			ID:      binary.BigEndian.Uint16(buf[icmpStart+4 : icmpStart+6]),
+			Seq:     binary.BigEndian.Uint16(buf[icmpStart+6 : icmpStart+8]),
+			Payload: buf[icmpStart+8 : n],
+		}
+		reply.Checksum = reply.CalculateChecksum()
 
-			// 使用独立的conn发送响应
-			// 使用net.Dial创建独立的原始套接字用于发送DART协议
-			sendConn, err := net.Dial("ip4:254", addr.String())
-			if err != nil {
-				log.Fatalf("Failed to create send connection: %v", err)
-			}
+		// 构造 DART 头（交换源/目标 FQDN）
+		dartHeader := &DARTHeader{
+			Version:       1,
+			UpperProtocol: ICMP_PROTOCOL,
+			DstLen:        uint8(len(srcFQDN)),
+			SrcLen:        uint8(len(dstFQDN)),
+			DstFQDN:       []byte(srcFQDN),
+			SrcFQDN:       []byte(dstFQDN),
+		}
+		dartPacket := dartHeader.Pack()
+		icmpPacket := reply.Pack()
+		fullPayload := append(dartPacket, icmpPacket...)
 
-			n, err = sendConn.Write(packet)
-			if err != nil {
-				log.Printf("Failed to send response: %v", err)
-			} else {
-				log.Printf("Responded to ping from %s (%s), size: %d", srcFQDN, addr.String(), n)
-			}
-			sendConn.Close()
+		// 使用 udpConn 发回响应，自动使用UDP_PORT为源端口
+		_, err = udpConn.WriteToUDP(fullPayload, srcAddr)
+		if err != nil {
+			log.Printf("Failed to send response: %v", err)
+		} else {
+			log.Printf("Responded to ping from %s (%s), size: %d", srcFQDN, srcAddr.String(), len(fullPayload))
 		}
 	}
 }

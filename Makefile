@@ -1,7 +1,7 @@
-# Makefile for dt_ping_server service installation
+# Makefile for dart_ping_daemon service installation
 
 # Service configuration
-SERVICE_NAME=dt_ping_server
+SERVICE_NAME=dart_ping_daemon
 SERVICE_FILE=/etc/systemd/system/$(SERVICE_NAME).service
 BINARY_PATH=/usr/local/bin/$(SERVICE_NAME)
 
@@ -12,7 +12,7 @@ build:
 # Install the service
 install: build
 	cp $(SERVICE_NAME) $(BINARY_PATH)
-	echo "[Unit]\nDescription=dt_ping_server service\nAfter=network.target\n\n[Service]\nExecStart=$(BINARY_PATH)\nRestart=always\nUser=root\n\n[Install]\nWantedBy=multi-user.target" > $(SERVICE_FILE)
+	echo "[Unit]\nDescription=dart_ping_daemon service\nAfter=network.target\n\n[Service]\nExecStart=$(BINARY_PATH)\nRestart=always\nUser=root\n\n[Install]\nWantedBy=multi-user.target" > $(SERVICE_FILE)
 	systemctl daemon-reload
 	systemctl enable $(SERVICE_NAME)
 	systemctl start $(SERVICE_NAME)
